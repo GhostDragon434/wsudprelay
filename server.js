@@ -134,7 +134,7 @@ const UDP_CONFIG = Object.freeze({
   IDLE_TIMEOUT_MS: 300000,
   XUDP_GRACE_MS: 60000,
   MAX_CONNECTIONS: 8192,
-  REJECT_UDP_443: !['0', 'false', 'off', 'no'].includes(String(process.env.REJECT_UDP_443 ?? 'true').trim().toLowerCase()),
+  REJECT_UDP_443: false,
 });
 
 const UDP_STATS = {
@@ -748,7 +748,6 @@ class MuxSession {
   }
   async sendUDP(target, payload) {
     if (!this.udp) throw new Error('UDP session unavailable');
-    if (rejectUdpTarget(target)) return;
     await this.udp.send(target, payload);
   }
   closeWithoutRemoving() {
@@ -801,7 +800,7 @@ class MuxConnection {
     throw new Error(`unknown mux status 0x${frame.status.toString(16).padStart(2, '0')}`);
   }
   async handleNew(frame) {
-    if (frame.network !== MUX_NETWORK_UDP || !frame.target?.host || !frame.target?.port) {
+    if (frame.network !== MUX_NETWORK_UDP || !frame.target?.host || !frame.target?.port || rejectUdpTarget(frame.target)) {
       await this.sendEnd(frame.id, true).catch(() => {});
       return;
     }
@@ -847,7 +846,10 @@ class MuxConnection {
       target = frame.target;
       session.target = target;
     }
-    if (rejectUdpTarget(target)) return; // drop QUIC packet only, keep session alive
+    if (rejectUdpTarget(target)) {
+      await session.close(true);
+      return;
+    }
     await session.sendUDP(target, frame.data).catch(() => session.close(true));
   }
   removeSession(id) {
