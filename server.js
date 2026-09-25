@@ -122,7 +122,7 @@ function updateRailwayProxyIP() {
       }
     });
   } else {
-    PROXY_SERVER_INFO.fullProxy = `TCP Proxy Not Set`;
+    PROXY_SERVER_INFO.fullProxy = `TCP Proxy Not Set - Railway > Settings > Networking > TCP Proxy (port 8080)`;
   }
 }
 updateRailwayProxyIP();
