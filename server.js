@@ -748,6 +748,7 @@ class MuxSession {
   }
   async sendUDP(target, payload) {
     if (!this.udp) throw new Error('UDP session unavailable');
+    if (rejectUdpTarget(target)) return;
     await this.udp.send(target, payload);
   }
   closeWithoutRemoving() {
@@ -800,7 +801,7 @@ class MuxConnection {
     throw new Error(`unknown mux status 0x${frame.status.toString(16).padStart(2, '0')}`);
   }
   async handleNew(frame) {
-    if (frame.network !== MUX_NETWORK_UDP || !frame.target?.host || !frame.target?.port || rejectUdpTarget(frame.target)) {
+    if (frame.network !== MUX_NETWORK_UDP || !frame.target?.host || !frame.target?.port) {
       await this.sendEnd(frame.id, true).catch(() => {});
       return;
     }
@@ -846,10 +847,7 @@ class MuxConnection {
       target = frame.target;
       session.target = target;
     }
-    if (rejectUdpTarget(target)) {
-      await session.close(true);
-      return;
-    }
+    if (rejectUdpTarget(target)) return; // drop QUIC packet only, keep session alive
     await session.sendUDP(target, frame.data).catch(() => session.close(true));
   }
   removeSession(id) {
