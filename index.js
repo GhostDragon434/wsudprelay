@@ -421,6 +421,8 @@ class UDPAssociation {
         this.udp6 = null;
         this.port = 0;
         this.sink = null;
+        this.pending = [];
+        this.pendingBytes = 0;
         this.closed = false;
     }
     static async create() {
@@ -448,6 +450,14 @@ class UDPAssociation {
     attach(sink) {
         const old = this.sink;
         this.sink = sink;
+        if (this.pending.length) {
+            const queued = this.pending;
+            this.pending = [];
+            this.pendingBytes = 0;
+            for (const item of queued) {
+                Promise.resolve(sink.mux.sendUDPData(sink.id, item.rinfo, item.data)).catch(() => { });
+            }
+        }
         return old;
     }
     detach(mux, id) {
@@ -480,6 +490,17 @@ class UDPAssociation {
         STATS.udpBytesIn += msg.length;
         const sink = this.sink;
         if (!sink || this.closed) {
+            // XUDP mempertahankan socket UDP saat koneksi VMess bermigrasi.
+            // Jangan buang balasan yang tiba di celah detach -> attach.
+            if (!this.closed && msg.length <= MAX_PACKET_LEN) {
+                const data = Buffer.from(msg);
+                this.pending.push({ data, rinfo: { address: rinfo.address, port: rinfo.port, family: rinfo.family } });
+                this.pendingBytes += data.length;
+                while (this.pending.length > 64 || this.pendingBytes > 256 * 1024) {
+                    const dropped = this.pending.shift();
+                    this.pendingBytes -= dropped ? dropped.data.length : 0;
+                }
+            }
             return;
         }
         Promise.resolve(sink.mux.sendUDPData(sink.id, rinfo, Buffer.from(msg))).catch(() => {
@@ -493,6 +514,8 @@ class UDPAssociation {
         }
         this.closed = true;
         this.sink = null;
+        this.pending = [];
+        this.pendingBytes = 0;
         if (this.udp4) {
             try {
                 this.udp4.close();
@@ -519,8 +542,20 @@ class XUDPManager {
         const key = Buffer.from(globalID).toString('hex');
         let entry = this.entries.get(key);
         if (!entry) {
-            entry = { assoc: await UDPAssociation.create(), timer: null };
+            // Simpan promise sebelum await agar dua sesi serentak dengan GlobalID
+            // yang sama tidak membuat dua socket UDP dan kehilangan balasan.
+            entry = { assoc: null, creating: UDPAssociation.create(), timer: null };
             this.entries.set(key, entry);
+        }
+        if (!entry.assoc) {
+            try {
+                entry.assoc = await entry.creating;
+                entry.creating = null;
+            }
+            catch (error) {
+                if (this.entries.get(key) === entry) this.entries.delete(key);
+                throw error;
+            }
         }
         if (entry.timer) {
             clearTimeout(entry.timer);
