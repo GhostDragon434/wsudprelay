@@ -383,12 +383,24 @@ async function readControl(reader) {
     return { mode, target };
 }
 
+// Cache DNS singkat. Tanpa ini setiap datagram ke tujuan berupa domain
+// (mis. server STUN WebRTC) memicu lookup baru -- paket pertama sering
+// terlambat dan tes UDP keburu timeout.
+const DNS_CACHE = new Map();
+const DNS_CACHE_TTL_MS = 60000;
+const DNS_CACHE_MAX = 512;
+
 async function resolveTarget(target) {
     if (target.atyp === ATYP_IPV4) {
         return { address: target.host, family: 4 };
     }
     if (target.atyp === ATYP_IPV6) {
         return { address: target.host, family: 6 };
+    }
+    const now = Date.now();
+    const cached = DNS_CACHE.get(target.host);
+    if (cached && cached.expires > now) {
+        return cached.value;
     }
     const records = await dns.lookup(target.host, { all: true, verbatim: true });
     if (!records.length) {
@@ -398,7 +410,12 @@ async function resolveTarget(target) {
     if (!preferred) {
         throw new Error(`DNS returned unsupported address for ${target.host}`);
     }
-    return preferred;
+    const value = { address: preferred.address, family: preferred.family };
+    if (DNS_CACHE.size >= DNS_CACHE_MAX) {
+        DNS_CACHE.delete(DNS_CACHE.keys().next().value);
+    }
+    DNS_CACHE.set(target.host, { value, expires: now + DNS_CACHE_TTL_MS });
+    return value;
 }
 
 function bindDgram(socket, port, address) {
@@ -703,9 +720,10 @@ async function readMuxFrame(reader) {
             }
             cursor += 8;
         }
-        if (cursor !== meta.length) {
-            throw new Error(`unexpected ${meta.length - cursor} byte(s) in mux New metadata`);
-        }
+        // Beberapa versi Xray/v2rayNG menambahkan byte ekstra (padding / field
+        // baru) di akhir metadata New. Dulu itu melempar error dan mematikan
+        // SELURUH koneksi Mux -- gejalanya UDP/WebRTC kadang jalan, kadang mati.
+        // Sekarang sisa byte diabaikan saja.
     }
     else if (frame.status === MUX_STATUS_KEEP && meta.length > cursor && meta[cursor] === MUX_NETWORK_UDP) {
         frame.network = meta[cursor++];
