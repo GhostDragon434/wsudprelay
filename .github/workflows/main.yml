@@ -1,0 +1,48 @@
+name: Build Dockerfile
+
+on:
+  # Memungkinkan workflow dijalankan secara manual dengan form isian
+  workflow_dispatch:
+    inputs:
+      tag_number:
+        description: 'Masukkan angka/nama untuk tag Docker (contoh: 1028)'
+        required: true
+        default: '1028'
+        type: string
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # =======================================================
+      # Step baru: Mengubah username/repo menjadi huruf kecil
+      # =======================================================
+      - name: Set lowercase repository name
+        run: |
+          echo "REPO_LC=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }} 
+
+      # =======================================================
+      # Build & Push (Label 1 baris lurus dengan pembatas |)
+      # =======================================================
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # Mengambil input lowercase dari env dan tag dari inputs
+          tags: ghcr.io/${{ env.REPO_LC }}:${{ inputs.tag_number }}
