@@ -93,16 +93,6 @@ function saveData() {
 }
 loadData();
 
-// ==========================================
-// PROCESS GUARD: relay tidak boleh mati hanya karena 1 koneksi bermasalah.
-// ==========================================
-process.on('uncaughtException', (err) => {
-  console.error('[Guard] uncaughtException:', err && err.message ? err.message : err);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('[Guard] unhandledRejection:', reason && reason.message ? reason.message : reason);
-});
-
 let PROXY_SERVER_INFO = {
   domain: TCP_DOMAIN,
   port: TCP_PORT,
@@ -122,7 +112,7 @@ function updateRailwayProxyIP() {
       }
     });
   } else {
-    PROXY_SERVER_INFO.fullProxy = `TCP Proxy Not Set - Railway > Settings > Networking > TCP Proxy (port 8080)`;
+    PROXY_SERVER_INFO.fullProxy = `TCP Proxy Not Set`;
   }
 }
 updateRailwayProxyIP();
@@ -144,7 +134,8 @@ const UDP_CONFIG = Object.freeze({
   IDLE_TIMEOUT_MS: 300000,
   XUDP_GRACE_MS: 60000,
   MAX_CONNECTIONS: 8192,
-  REJECT_UDP_443: false,
+  // true: buang hanya QUIC Initial pada UDP/443; STUN/TURN/WebRTC tetap lewat.
+  REJECT_UDP_443: /^(?:1|true|yes|on)$/i.test(String(process.env.REJECT_UDP_443 === undefined ? '1' : process.env.REJECT_UDP_443).trim()),
 });
 
 const UDP_STATS = {
@@ -177,27 +168,23 @@ function formatDynamicBytes(bytes) {
 
 async function resolveDomain(hostname) {
   const now = Date.now();
-  if (net.isIP(hostname)) return hostname;
   const cached = dnsCache.get(hostname);
-  // TTL 10 menit: cukup cepat, tapi tidak "mengunci" IP yang sudah basi.
-  if (cached && (now - cached.time < 1000 * 60 * 10)) return cached.ip;
-
-  const remember = (ip) => {
-    dnsCache.set(hostname, { ip, time: now });
-    return ip;
-  };
+  // Cache dipertahankan selama 1 jam untuk mencegah jeda resolve berulang
+  if (cached && (now - cached.time < 1000 * 60 * 60)) return cached.ip;
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname)) return hostname;
 
   if (DNS_CONFIG.mode === 'UDP' && DNS_CONFIG.udpServer) {
     try {
-      const resolver = new dns.Resolver({ timeout: 2000, tries: 2 });
+      const resolver = new dns.Resolver();
       resolver.setServers([`${DNS_CONFIG.udpServer}:${DNS_CONFIG.udpPort || 53}`]);
-      const address = await new Promise((resolve, reject) => {
+      return await new Promise((resolve, reject) => {
         resolver.resolve4(hostname, (err, addresses) => {
-          if (!err && addresses && addresses.length > 0) resolve(addresses[0]);
-          else reject(err || new Error('empty DNS answer'));
+          if (!err && addresses && addresses.length > 0) {
+            dnsCache.set(hostname, { ip: addresses[0], time: now });
+            resolve(addresses[0]);
+          } else reject(err);
         });
       });
-      return remember(address);
     } catch (_) {}
   }
 
@@ -208,23 +195,26 @@ async function resolveDomain(hostname) {
       url.searchParams.set('type', 'A');
       const res = await fetch(url.toString(), {
         headers: { 'Accept': 'application/dns-json' },
-        signal: AbortSignal.timeout(4000)
+        signal: AbortSignal.timeout(1500)
       });
       const data = await res.json();
-      const aRecord = (data.Answer || []).find((ans) => ans.type === 1);
-      if (aRecord && aRecord.data) return remember(aRecord.data);
+      if (data.Answer && data.Answer.length > 0) {
+        const aRecord = data.Answer.find(ans => ans.type === 1);
+        if (aRecord && aRecord.data) {
+          dnsCache.set(hostname, { ip: aRecord.data, time: now });
+          return aRecord.data;
+        }
+      }
     } catch (_) {}
   }
 
-  // Fallback terakhir: resolver sistem (IPv4 lalu IPv6).
-  // PENTING: jangan pernah mengembalikan IP hardcoded — itu membuat trafik
-  // dikirim ke server yang salah sehingga koneksi ditutup (ERR_CONNECTION_CLOSED).
-  try {
-    const result = await dnsPromises.lookup(hostname, { all: false });
-    if (result && result.address) return remember(result.address);
-  } catch (_) {}
-
-  throw new Error(`DNS resolve failed for ${hostname}`);
+  return new Promise((resolve) => {
+    dns.lookup(hostname, (err, address) => {
+      const ip = (!err && address) ? address : '104.16.123.96';
+      dnsCache.set(hostname, { ip, time: now });
+      resolve(ip);
+    });
+  });
 }
 
 function checkHttpAuth(dataStr) {
@@ -298,8 +288,25 @@ const MAX_MUX_META_LEN = 512;
 const MAX_PACKET_LEN = 65535;
 const utf8Fatal = new TextDecoder('utf-8', { fatal: true });
 
-function rejectUdpTarget(target) {
-  return Boolean(UDP_CONFIG.REJECT_UDP_443 && Number(target?.port) === 443);
+// Kenali QUIC Initial dari header paket, bukan sekadar nomor port, supaya
+// STUN/TURN/WebRTC yang sah pada UDP/443 tidak ikut terblokir.
+function isQuicInitial(payload) {
+  const b = Buffer.from(payload || []);
+  if (b.length < 7 || (b[0] & 0xc0) !== 0xc0) return false;
+  const version = b.readUInt32BE(1);
+  if (version === 0) return false;
+  const packetType = (b[0] >>> 4) & 0x03;
+  const isV1Initial = version === 0x00000001 && packetType === 0;
+  const isV2Initial = version === 0x6b3343cf && packetType === 1;
+  if (!isV1Initial && !isV2Initial) return false;
+  const dcidLength = b[5];
+  if (dcidLength > 20 || b.length < 7 + dcidLength) return false;
+  const scidLength = b[6 + dcidLength];
+  return scidLength <= 20 && b.length >= 7 + dcidLength + scidLength;
+}
+
+function rejectUdpPacket(target, payload) {
+  return Boolean(UDP_CONFIG.REJECT_UDP_443 && Number(target?.port) === 443 && isQuicInitial(payload));
 }
 
 class AsyncByteReader {
@@ -648,10 +655,6 @@ class XUDPManager {
 }
 
 async function serveDirectUDP(socket, reader, target) {
-  if (rejectUdpTarget(target)) {
-    await writeControlError(socket, 'UDP/443 rejected');
-    return;
-  }
   const assoc = await UDPAssociation.create();
   let closed = false;
   assoc.attach({
@@ -670,7 +673,7 @@ async function serveDirectUDP(socket, reader, target) {
     await writeSocket(socket, Buffer.from([0]));
     for (;;) {
       const payload = await readLengthPayload(reader);
-      if (payload.length === 0 || rejectUdpTarget(target)) continue;
+      if (payload.length === 0 || rejectUdpPacket(target, payload)) continue;
       await assoc.send(target, payload);
     }
   } finally {
@@ -703,7 +706,7 @@ async function servePacketUDP(socket, reader) {
     for (;;) {
       const target = await readEndpoint(reader);
       const payload = await readLengthPayload(reader);
-      if (payload.length === 0 || rejectUdpTarget(target)) continue;
+      if (payload.length === 0 || rejectUdpPacket(target, payload)) continue;
       await assoc.send(target, payload);
     }
   } finally {
@@ -811,7 +814,7 @@ class MuxConnection {
     throw new Error(`unknown mux status 0x${frame.status.toString(16).padStart(2, '0')}`);
   }
   async handleNew(frame) {
-    if (frame.network !== MUX_NETWORK_UDP || !frame.target?.host || !frame.target?.port || rejectUdpTarget(frame.target)) {
+    if (frame.network !== MUX_NETWORK_UDP || !frame.target?.host || !frame.target?.port) {
       await this.sendEnd(frame.id, true).catch(() => {});
       return;
     }
@@ -843,7 +846,9 @@ class MuxConnection {
         return;
       }
     }
-    if (frame.data.length) await session.sendUDP(frame.target, frame.data).catch(() => session.close(true));
+    if (frame.data.length && !rejectUdpPacket(frame.target, frame.data)) {
+      await session.sendUDP(frame.target, frame.data).catch(() => session.close(true));
+    }
   }
   async handleKeep(frame) {
     const session = this.sessions.get(frame.id);
@@ -857,10 +862,7 @@ class MuxConnection {
       target = frame.target;
       session.target = target;
     }
-    if (rejectUdpTarget(target)) {
-      await session.close(true);
-      return;
-    }
+    if (rejectUdpPacket(target, frame.data)) return;
     await session.sendUDP(target, frame.data).catch(() => session.close(true));
   }
   removeSession(id) {
@@ -1811,14 +1813,7 @@ function setupConnectionHandler(clientSocket) {
         connData.target = `${targetHost}:${targetPort}`;
         activeConnections.set(connId, connData);
 
-        let resolvedIp;
-        try {
-          resolvedIp = await resolveDomain(targetHost);
-        } catch (err) {
-          activeConnections.delete(connId);
-          clientSocket.write('HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
-          return clientSocket.end();
-        }
+        const resolvedIp = await resolveDomain(targetHost);
         targetSocket = net.connect({ host: resolvedIp, port: targetPort, noDelay: true }, () => {
           targetSocket.setNoDelay(true);
           targetSocket.setKeepAlive(true, 5000);
@@ -1851,14 +1846,7 @@ function setupConnectionHandler(clientSocket) {
             activeConnections.set(connId, connData);
           }
 
-          let resolvedIp;
-          try {
-            resolvedIp = await resolveDomain(targetHost);
-          } catch (err) {
-            activeConnections.delete(connId);
-            clientSocket.write('HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
-            return clientSocket.end();
-          }
+          const resolvedIp = await resolveDomain(targetHost);
           targetSocket = net.connect({ host: resolvedIp, port: targetPort, noDelay: true }, () => {
             targetSocket.setNoDelay(true);
             targetSocket.setKeepAlive(true, 5000);
@@ -1903,13 +1891,7 @@ function setupConnectionHandler(clientSocket) {
       connData.target = `${destinationHost}:${destinationPort}`;
       activeConnections.set(connId, connData);
 
-      let resolvedIp;
-      try {
-        resolvedIp = await resolveDomain(destinationHost);
-      } catch (err) {
-        activeConnections.delete(connId);
-        return clientSocket.destroy();
-      }
+      const resolvedIp = await resolveDomain(destinationHost);
       targetSocket = net.connect({ host: resolvedIp, port: destinationPort, noDelay: true }, () => {
         targetSocket.setNoDelay(true);
         targetSocket.setKeepAlive(true, 5000);
